@@ -1,0 +1,158 @@
+name: free-lipsync-pool
+on:
+  push:
+    branches: [lipsync-free-pool]
+  workflow_dispatch:
+
+jobs:
+  lipsync:
+    strategy:
+      fail-fast: false
+      matrix:
+        space:
+          - manavisrani07/gradio-lipsync-wav2lip
+          - Uniaff/gradio-lipsync-wav2lip
+          - guardiancc/gradio-lipsync-wav2lip
+          - smartdigitalnetworks/gradio-lipsync-wav2lip
+          - lmh07072000/gradio-lipsync-wav2lip
+          - KatieMillman/gradio-lipsync-wav2lip
+          - artificialtechnologist/gradio-lipsync-wav2lip
+          - nijisakai/gradio-lipsync-wav2lip
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install client
+        run: |
+          python -m pip install --upgrade gradio_client requests
+      - name: Download source portrait and 5s audio
+        run: |
+          python - <<'PY'
+          import requests
+          items={
+            'face.jpg':'https://cdn.creativeclaw.co/u/18b47ea6/images/5b90400d-febe-4e49-bcd6-3231792e76ec.jpg',
+            'audio.mp3':'https://cdn.creativeclaw.co/u/18b47ea6/audio/d6551629-6299-412c-95a3-89f96910488b.mp3'
+          }
+          for p,u in items.items():
+              r=requests.get(u,timeout=120); r.raise_for_status(); open(p,'wb').write(r.content)
+          PY
+      - name: Try Space
+        env:
+          SPACE: ${{ matrix.space }}
+        run: |
+          timeout 600s python - <<'PY'
+          import os, shutil, requests, traceback
+          from gradio_client import Client, handle_file
+
+          space=os.environ['SPACE']
+          safe=space.replace('/','__')
+          out=f'out_{safe}.mp4'
+          print('SPACE',space,flush=True)
+          c=Client(space, verbose=True)
+
+          def extract(x):
+              if isinstance(x,str):
+                  if os.path.exists(x) and x.lower().endswith(('.mp4','.mov','.mkv','.webm')):
+                      return x
+                  if x.startswith('http'):
+                      try:
+                          r=requests.get(x,timeout=120)
+                          if r.ok and 'video' in r.headers.get('content-type',''):
+                              open(out,'wb').write(r.content); return out
+                      except Exception: pass
+              if isinstance(x,dict):
+                  for k in ['video','path','name','url']:
+                      if k in x:
+                          p=extract(x[k])
+                          if p:return p
+                  for v in x.values():
+                      p=extract(v)
+                      if p:return p
+              if isinstance(x,(list,tuple)):
+                  for v in x:
+                      p=extract(v)
+                      if p:return p
+              return None
+
+          # First try named endpoints discovered from view_api.
+          try:
+              api=c.view_api(return_format='dict')
+              print('API',api,flush=True)
+              named=(api or {}).get('named_endpoints',{}) if isinstance(api,dict) else {}
+          except Exception as e:
+              print('view_api failed',repr(e),flush=True)
+              named={}
+
+          def val_for(p):
+              s=' '.join(str(p.get(k,'')) for k in ['label','parameter_name','component','type']).lower()
+              if any(t in s for t in ['video','image','face','clip']): return handle_file('face.jpg')
+              if 'audio' in s or 'voice' in s or 'speech' in s: return handle_file('audio.mp3')
+              if 'checkpoint' in s or 'model' in s: return 'wav2lip_gan'
+              if 'smooth' in s: return False
+              if 'resize' in s or 'factor' in s: return 1
+              if 'bottom' in s: return 10
+              if 'pad' in s: return 0
+              py=str(p.get('python_type','')).lower()
+              if 'bool' in py: return False
+              if any(t in py for t in ['int','float','number']): return 0
+              if p.get('parameter_has_default'):
+                  return p.get('default',None)
+              return None
+
+          errors=[]
+          for name,spec in named.items():
+              params=spec.get('parameters',[]) if isinstance(spec,dict) else []
+              if not params: continue
+              args=[val_for(p) for p in params]
+              # Only attempt endpoints that appear to involve both face/video and audio.
+              desc=' '.join(str(p) for p in params).lower()
+              if not ('audio' in desc and any(t in desc for t in ['video','image','face','clip'])):
+                  continue
+              try:
+                  print('TRY API',name,'ARGS',args,flush=True)
+                  r=c.predict(*args, api_name=name)
+                  print('RESULT',r,flush=True)
+                  p=extract(r)
+                  if p:
+                      if p!=out: shutil.copy2(p,out)
+                      print('SUCCESS',out,flush=True); break
+              except Exception as e:
+                  errors.append((name,repr(e))); print('ERR API',name,repr(e),flush=True)
+          else:
+              # Common Wav2Lip signatures against first few fn indexes and common names.
+              combos=[
+                [handle_file('face.jpg'),handle_file('audio.mp3'),'wav2lip_gan',False,1,0,10,0,0],
+                [handle_file('face.jpg'),handle_file('audio.mp3'),'wav2lip_gan',0,10,0,0,1],
+                [handle_file('face.jpg'),handle_file('audio.mp3'),'wav2lip_gan'],
+                [handle_file('face.jpg'),handle_file('audio.mp3')],
+              ]
+              ok=False
+              for api_name in ['/generate','/predict','/run',None]:
+                  for combo in combos:
+                      for fn in range(0,5) if api_name is None else [None]:
+                          try:
+                              print('TRY COMMON',api_name,fn,len(combo),flush=True)
+                              kw={'api_name':api_name} if api_name else {'fn_index':fn}
+                              r=c.predict(*combo, **kw)
+                              print('RESULT2',r,flush=True)
+                              p=extract(r)
+                              if p:
+                                  if p!=out: shutil.copy2(p,out)
+                                  ok=True; break
+                          except Exception as e:
+                              errors.append((f'{api_name}/{fn}',repr(e)))
+                      if ok: break
+                  if ok: break
+              if not ok:
+                  print('ALL ERRORS',errors[-20:],flush=True)
+                  raise RuntimeError('No working lip-sync endpoint in this Space')
+
+          if not os.path.exists(out): raise RuntimeError('No output file')
+          print('DONE',out,os.path.getsize(out),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: lipsync-${{ strategy.job-index }}
+          path: out_*.mp4
+          retention-days: 1
