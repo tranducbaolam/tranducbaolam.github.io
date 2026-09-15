@@ -1,0 +1,137 @@
+name: faceswap-full-free
+on:
+  push:
+    branches: [faceswap-full-free]
+  workflow_dispatch:
+permissions:
+  contents: write
+
+jobs:
+  scene:
+    strategy:
+      fail-fast: false
+      max-parallel: 9
+      matrix:
+        include:
+          - {id: '01', start: '0.00',   dur: '16.50', role: 'mc'}
+          - {id: '02', start: '16.50',  dur: '19.10', role: 'nd'}
+          - {id: '03', start: '35.60',  dur: '8.60',  role: 'mc'}
+          - {id: '04', start: '44.20',  dur: '26.40', role: 'nd'}
+          - {id: '05', start: '70.60',  dur: '7.20',  role: 'mc'}
+          - {id: '06', start: '77.80',  dur: '43.70', role: 'nd'}
+          - {id: '07', start: '121.50', dur: '12.20', role: 'mc'}
+          - {id: '08', start: '133.70', dur: '29.00', role: 'nd'}
+          - {id: '09', start: '162.70', dur: '4.20',  role: 'mc'}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg libgl1
+          python -m pip install --upgrade pip
+          python -m pip install 'numpy<2' opencv-python-headless onnxruntime insightface requests
+      - name: Download source media and models
+        run: |
+          python - <<'PY'
+          import requests
+          files={
+            'source.mp4':'https://cdn.creativeclaw.co/u/18b47ea6/videos/4dabe3fd-aba1-4d5b-8092-2edee9b6182d.mp4',
+            'mc.jpg':'https://cdn.creativeclaw.co/u/18b47ea6/images/5b90400d-febe-4e49-bcd6-3231792e76ec.jpg',
+            'nd.jpg':'https://cdn.creativeclaw.co/u/18b47ea6/images/11704424-e5ba-41f3-b2c1-e83af3ff92b9.jpg',
+            'inswapper_128.onnx':'https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx'
+          }
+          for p,u in files.items():
+              r=requests.get(u,timeout=240); r.raise_for_status(); open(p,'wb').write(r.content)
+          PY
+          ffmpeg -y -loglevel error -ss ${{ matrix.start }} -t ${{ matrix.dur }} -i source.mp4 -c:v libx264 -preset ultrafast -crf 20 -c:a aac -ar 48000 -ac 2 scene_in.mp4
+      - name: Swap identities while preserving source motion
+        env:
+          ROLE: ${{ matrix.role }}
+        run: |
+          python - <<'PY'
+          import cv2, os, math
+          from insightface.app import FaceAnalysis
+          from insightface.model_zoo import get_model
+
+          role=os.environ['ROLE']
+          app=FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+          app.prepare(ctx_id=0, det_size=(512,512))
+          swapper=get_model('inswapper_128.onnx', providers=['CPUExecutionProvider'])
+
+          def source_face(path):
+              img=cv2.imread(path)
+              faces=app.get(img)
+              if not faces: raise RuntimeError('No source face detected: '+path)
+              return max(faces, key=lambda f:(f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+
+          mc=source_face('mc.jpg'); nd=source_face('nd.jpg')
+          cap=cv2.VideoCapture('scene_in.mp4')
+          fps=cap.get(cv2.CAP_PROP_FPS) or 30.0
+          w=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+          out=cv2.VideoWriter('scene_swap.mp4',cv2.VideoWriter_fourcc(*'mp4v'),fps,(w,h))
+          frame_idx=0; swapped_frames=0
+          while True:
+              ok,frame=cap.read()
+              if not ok: break
+              faces=app.get(frame)
+              if len(faces)>=2:
+                  # Wide/reaction shot: preserve both identities by screen position.
+                  ordered=sorted(faces, key=lambda f:(f.bbox[0]+f.bbox[2])*0.5)
+                  try:
+                      frame=swapper.get(frame,ordered[0],mc,paste_back=True)
+                      frame=swapper.get(frame,ordered[-1],nd,paste_back=True)
+                      swapped_frames+=1
+                  except Exception as e:
+                      print('wide swap error',frame_idx,e)
+              elif len(faces)==1:
+                  src=mc if role=='mc' else nd
+                  try:
+                      frame=swapper.get(frame,faces[0],src,paste_back=True)
+                      swapped_frames+=1
+                  except Exception as e:
+                      print('single swap error',frame_idx,e)
+              out.write(frame); frame_idx+=1
+          cap.release(); out.release()
+          print('frames',frame_idx,'swapped',swapped_frames)
+          PY
+          ffmpeg -y -loglevel error -i scene_swap.mp4 -i scene_in.mp4 -map 0:v:0 -map 1:a:0? -c:v libx264 -preset veryfast -crf 19 -pix_fmt yuv420p -r 30 -c:a aac -b:a 160k -ar 48000 -ac 2 -shortest seg${{ matrix.id }}.mp4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seg${{ matrix.id }}
+          path: seg${{ matrix.id }}.mp4
+          retention-days: 1
+
+  merge:
+    needs: scene
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: seg*
+          path: clips
+          merge-multiple: true
+      - name: Merge scenes
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          find clips -maxdepth 1 -name 'seg*.mp4' -print | sort
+          for f in $(find clips -maxdepth 1 -name 'seg*.mp4' | sort); do echo "file '$PWD/$f'"; done > concat.txt
+          ffmpeg -y -loglevel error -f concat -safe 0 -i concat.txt -c copy final_faceswap.mp4 || ffmpeg -y -loglevel error -f concat -safe 0 -i concat.txt -c:v libx264 -preset veryfast -crf 19 -c:a aac -b:a 160k final_faceswap.mp4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: final-faceswap
+          path: final_faceswap.mp4
+          retention-days: 1
+      - name: Publish final MP4 on branch
+        run: |
+          mkdir -p output
+          cp final_faceswap.mp4 output/Phong_van_thay_mat_FREE.mp4
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add output/Phong_van_thay_mat_FREE.mp4
+          git commit -m 'Add free face-swapped interview video'
+          git push origin HEAD:faceswap-full-free
