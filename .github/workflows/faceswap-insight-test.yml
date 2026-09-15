@@ -1,0 +1,71 @@
+name: faceswap-insight-test
+on:
+  push:
+    branches: [faceswap-insight]
+  workflow_dispatch:
+
+jobs:
+  faceswap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg libgl1
+          python -m pip install --upgrade pip
+          python -m pip install 'numpy<2' opencv-python-headless onnxruntime insightface requests
+      - name: Download inputs and model
+        run: |
+          python - <<'PY'
+          import requests
+          files={
+            'source.mp4':'https://cdn.creativeclaw.co/u/18b47ea6/videos/4dabe3fd-aba1-4d5b-8092-2edee9b6182d.mp4',
+            'mc.jpg':'https://cdn.creativeclaw.co/u/18b47ea6/images/5b90400d-febe-4e49-bcd6-3231792e76ec.jpg',
+            'nd.jpg':'https://cdn.creativeclaw.co/u/18b47ea6/images/11704424-e5ba-41f3-b2c1-e83af3ff92b9.jpg',
+            'inswapper_128.onnx':'https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx'
+          }
+          for p,u in files.items():
+              r=requests.get(u,timeout=180); r.raise_for_status(); open(p,'wb').write(r.content)
+          PY
+          ffmpeg -y -loglevel error -ss 0 -t 5.05 -i source.mp4 -c:v libx264 -preset veryfast -crf 21 -c:a aac test5.mp4
+      - name: Face swap MC into first 5 seconds
+        run: |
+          python - <<'PY'
+          import cv2, os, numpy as np
+          from insightface.app import FaceAnalysis
+          from insightface.model_zoo import get_model
+
+          app=FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+          app.prepare(ctx_id=0, det_size=(640,640))
+          swapper=get_model('inswapper_128.onnx', providers=['CPUExecutionProvider'])
+
+          src_img=cv2.imread('mc.jpg')
+          src_faces=app.get(src_img)
+          if not src_faces: raise RuntimeError('No source MC face detected')
+          src=max(src_faces, key=lambda f:(f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+
+          cap=cv2.VideoCapture('test5.mp4')
+          fps=cap.get(cv2.CAP_PROP_FPS) or 30
+          w=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+          fourcc=cv2.VideoWriter_fourcc(*'mp4v')
+          out=cv2.VideoWriter('swapped_noaudio.mp4',fourcc,fps,(w,h))
+          n=0
+          while True:
+              ok,frame=cap.read()
+              if not ok: break
+              faces=app.get(frame)
+              if faces:
+                  tgt=max(faces,key=lambda f:(f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+                  try: frame=swapper.get(frame,tgt,src,paste_back=True)
+                  except Exception as e: print('swap error frame',n,e)
+              out.write(frame); n+=1
+          cap.release(); out.release(); print('frames',n)
+          PY
+          ffmpeg -y -loglevel error -i swapped_noaudio.mp4 -i test5.mp4 -map 0:v:0 -map 1:a:0? -c:v libx264 -preset veryfast -crf 20 -c:a aac -shortest faceswap_test5.mp4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: faceswap-test5
+          path: faceswap_test5.mp4
+          retention-days: 1
