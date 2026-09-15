@@ -1,0 +1,75 @@
+name: video-faceswap-alt
+on:
+  push:
+    branches: [video-faceswap-temp]
+  workflow_dispatch:
+
+jobs:
+  swap:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - key: aidao
+            space: aidao/FaceSwap
+          - key: wornout
+            space: wornoutFlamingo6/FaceSwapAll
+          - key: dearponie
+            space: dearPonie8/FaceSwapAll
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python -m pip install --upgrade gradio_client requests
+      - name: Download and cut 5s test
+        run: |
+          python - <<'PY'
+          import requests
+          urls={
+            'src':'https://cdn.creativeclaw.co/u/18b47ea6/videos/5d47cee4-149a-4934-8ad5-f759ef8f04a5.mkv',
+            'mc':'https://cdn.creativeclaw.co/u/18b47ea6/images/5b90400d-febe-4e49-bcd6-3231792e76ec.jpg'
+          }
+          for k,u in urls.items():
+              ext='.mkv' if k=='src' else '.jpg'
+              r=requests.get(u,timeout=120); r.raise_for_status()
+              open(k+ext,'wb').write(r.content)
+          PY
+          ffmpeg -y -loglevel error -ss 0 -t 5 -i src.mkv -c:v libx264 -preset veryfast -crf 22 -c:a aac -b:a 128k test_in.mp4
+      - name: Face swap
+        env:
+          SPACE: ${{ matrix.space }}
+        run: |
+          timeout 420s python - <<'PY'
+          from gradio_client import Client, handle_file
+          import os, shutil
+          space=os.environ['SPACE']
+          print('SPACE',space,flush=True)
+          c=Client(space, verbose=True)
+          # Most FaceSwapAll clones expose the same video endpoint.
+          result=c.predict(
+              src_img=handle_file('mc.jpg'),
+              src_idx=1,
+              video=handle_file('test_in.mp4'),
+              dst_idx=1,
+              delete_frames_dir=True,
+              add_audio=True,
+              copy_to_drive=False,
+              api_name='/predict_5'
+          )
+          print('RESULT',result,flush=True)
+          v=result[0]
+          path=v.get('video') if isinstance(v,dict) else str(v)
+          if not path or not os.path.exists(path):
+              raise RuntimeError(f'No output path: {path!r}')
+          shutil.copy2(path,'faceswap_test.mp4')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: faceswap-${{ matrix.key }}
+          path: faceswap_test.mp4
+          retention-days: 1
