@@ -1,0 +1,40 @@
+name: video-faceswap-probe
+on:
+  push:
+    branches: [video-faceswap-temp]
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Gradio client
+        run: python -m pip install --upgrade gradio_client
+      - name: Probe free Hugging Face Spaces
+        run: |
+          python - <<'PY'
+          from gradio_client import Client
+          spaces = [
+              'V0pr0S/FaceFusion-Face-Swap-Hyperswap',
+              'ALSv/FaceSwapAll',
+              'debatable/InsightFace-Face_Swapper-on_video',
+          ]
+          for space in spaces:
+              print('\n' + '='*100)
+              print('SPACE:', space)
+              try:
+                  c = Client(space, verbose=False)
+                  print('CONFIG VERSION:', c.config.get('version'))
+                  print('NAMED ENDPOINTS:')
+                  for e in getattr(c, 'endpoints', {}).values():
+                      try:
+                          print('  ', e.api_name, '->', e.fn_index)
+                      except Exception:
+                          print('  ', e)
+                  print('VIEW API:')
+                  c.view_api()
+              except Exception as e:
+                  print('ERROR:', type(e).__name__, str(e))
+          PY
