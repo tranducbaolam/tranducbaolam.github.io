@@ -1,0 +1,85 @@
+name: wav2lip-test
+on:
+  push:
+    branches: [video-faceswap-temp]
+  workflow_dispatch:
+
+jobs:
+  lipsync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python -m pip install --upgrade gradio_client requests
+      - name: Download inputs
+        run: |
+          python - <<'PY'
+          import requests
+          files={
+            'src.mkv':'https://cdn.creativeclaw.co/u/18b47ea6/videos/5d47cee4-149a-4934-8ad5-f759ef8f04a5.mkv',
+            'audio.mp3':'https://cdn.creativeclaw.co/u/18b47ea6/audio/d6551629-6299-412c-95a3-89f96910488b.mp3'
+          }
+          for p,u in files.items():
+              r=requests.get(u,timeout=120); r.raise_for_status(); open(p,'wb').write(r.content)
+          PY
+          ffmpeg -y -loglevel error -ss 0 -t 5.05 -i src.mkv -c:v libx264 -preset veryfast -crf 22 -an input.mp4
+      - name: Probe and run Wav2Lip Space
+        run: |
+          timeout 600s python - <<'PY'
+          from gradio_client import Client, handle_file
+          import os, shutil
+          space='manavisrani07/gradio-lipsync-wav2lip'
+          c=Client(space, verbose=True)
+          print('APIS:', flush=True)
+          c.view_api()
+          # Try common named endpoint, then first endpoint accepting video/audio-like inputs.
+          attempts=[]
+          for api in ['/generate','/predict','/run']:
+              try:
+                  print('TRY',api,flush=True)
+                  r=c.predict(handle_file('input.mp4'), handle_file('audio.mp3'), 'wav2lip_gan', False, 1, 0, 10, 0, 0, api_name=api)
+                  print('RESULT',r,flush=True)
+                  attempts.append(r)
+                  break
+              except Exception as e:
+                  print('ERR',api,repr(e),flush=True)
+          if not attempts:
+              # inspect endpoints and call first likely one using defaults after video/audio
+              for ep in c.endpoints.values():
+                  name=getattr(ep,'api_name',None)
+                  if not name: continue
+                  try:
+                      print('FALLBACK',name,flush=True)
+                      r=c.predict(handle_file('input.mp4'), handle_file('audio.mp3'), api_name=name)
+                      print('RESULT2',r,flush=True)
+                      attempts.append(r); break
+                  except Exception as e:
+                      print('ERR2',name,repr(e),flush=True)
+          if not attempts: raise RuntimeError('No Wav2Lip endpoint succeeded')
+          r=attempts[-1]
+          def find_path(x):
+              if isinstance(x,str) and os.path.exists(x): return x
+              if isinstance(x,dict):
+                  for k in ['video','path','name']:
+                      v=x.get(k)
+                      if isinstance(v,str) and os.path.exists(v): return v
+                  for v in x.values():
+                      p=find_path(v)
+                      if p:return p
+              if isinstance(x,(list,tuple)):
+                  for v in x:
+                      p=find_path(v)
+                      if p:return p
+          p=find_path(r)
+          if not p: raise RuntimeError(f'No local output found in {r!r}')
+          shutil.copy2(p,'wav2lip_test.mp4')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wav2lip-test
+          path: wav2lip_test.mp4
+          retention-days: 1
