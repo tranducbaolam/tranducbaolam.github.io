@@ -1,0 +1,61 @@
+name: video-faceswap-test
+on:
+  push:
+    branches: [video-faceswap-temp]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install client
+        run: python -m pip install --upgrade gradio_client requests
+      - name: Download and cut 5s test
+        run: |
+          python - <<'PY'
+          import requests
+          urls={
+            'src':'https://cdn.creativeclaw.co/u/18b47ea6/videos/5d47cee4-149a-4934-8ad5-f759ef8f04a5.mkv',
+            'mc':'https://cdn.creativeclaw.co/u/18b47ea6/images/5b90400d-febe-4e49-bcd6-3231792e76ec.jpg'
+          }
+          for k,u in urls.items():
+              ext='.mkv' if k=='src' else '.jpg'
+              r=requests.get(u,timeout=120); r.raise_for_status()
+              open(k+ext,'wb').write(r.content)
+              print(k, len(r.content))
+          PY
+          ffmpeg -y -ss 0 -t 5 -i src.mkv -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 160k test_in.mp4
+      - name: Free face swap on Hugging Face Space
+        run: |
+          python - <<'PY'
+          from gradio_client import Client, handle_file
+          import os, shutil
+          c=Client('ALSv/FaceSwapAll', verbose=True)
+          result=c.predict(
+              src_img=handle_file('mc.jpg'),
+              src_idx=1,
+              video=handle_file('test_in.mp4'),
+              dst_idx=1,
+              delete_frames_dir=True,
+              add_audio=True,
+              copy_to_drive=False,
+              api_name='/predict_5'
+          )
+          print('RESULT=', result)
+          video=result[0]
+          if isinstance(video, dict):
+              path=video.get('video') or video.get('path')
+          else:
+              path=str(video)
+          if not path or not os.path.exists(path):
+              raise RuntimeError(f'Output video not found: {path!r}')
+          shutil.copy2(path,'faceswap_test.mp4')
+          print('saved',os.path.getsize('faceswap_test.mp4'))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: faceswap-test
+          path: faceswap_test.mp4
+          retention-days: 1
